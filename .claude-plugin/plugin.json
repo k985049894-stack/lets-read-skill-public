@@ -1,0 +1,15 @@
+{
+  "name": "lets-read",
+  "version": "2.4.0",
+  "description": "Let's Read：为一本书写研究用读书笔记：书评体正文加结构化附录，引文逐字核对，附录可被脚本归并成跨书概念库。",
+  "author": {
+    "name": "k985049894-stack"
+  },
+  "repository": "https://github.com/k985049894-stack/lets-read-skill-public",
+  "keywords": [
+    "读书笔记",
+    "书评",
+    "research",
+    "reading-notes"
+  ]
+}

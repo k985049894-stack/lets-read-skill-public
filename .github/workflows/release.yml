@@ -1,0 +1,141 @@
+# 自动发版
+#
+# 推送到 main 时：读 .claude-plugin/plugin.json 的版本号，如果这个版本还没有标签，
+# 就打包、打标签 vX.Y.Z、创建 Release（说明取自 CHANGELOG.md 里对应的一节，附上 .plugin）。
+# 版本已经发过则跳过；如果内容改了版本号却没升，会给出提醒。
+#
+# 手动运行（Actions 页面 → 发版 → Run workflow）用来补发历史版本：
+#   ref      要发布的提交、分支或标签，例如 main 或 v2.4.0
+#   version  只有目标提交里没有 plugin.json（如仅包含 skill 的版本）时才需要填
+# 手动补发的版本不会被标成“最新版”。
+
+name: 发版
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 要发布的提交、分支或标签（留空 = main 的最新提交）
+        required: false
+        default: ''
+      version:
+        description: 版本号，如 1.0.0（目标提交没有 plugin.json 时才需要）
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 确定要发布的版本
+        id: meta
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          TARGET="${INPUT_REF:-$GITHUB_SHA}"
+          SHA=$(git rev-parse -q --verify "${TARGET}^{commit}" || git rev-parse -q --verify "origin/${TARGET}^{commit}") \
+            || { echo "::error::找不到要发布的提交：${TARGET}"; exit 1; }
+          git worktree add --detach target "$SHA"
+
+          if [ -f target/.claude-plugin/plugin.json ]; then
+            KIND=plugin
+            NAME=$(python3 -c "import json;print(json.load(open('target/.claude-plugin/plugin.json'))['name'])")
+            VER=$(python3 -c "import json;print(json.load(open('target/.claude-plugin/plugin.json'))['version'])")
+            if [ -n "$INPUT_VERSION" ] && [ "$INPUT_VERSION" != "$VER" ]; then
+              echo "::error::填写的版本号 ${INPUT_VERSION} 与 plugin.json 里的 ${VER} 不一致"; exit 1
+            fi
+          else
+            KIND=skill
+            NAME=lets-read
+            VER="$INPUT_VERSION"
+            [ -n "$VER" ] || { echo "::error::目标提交里没有 plugin.json，请在 version 里填版本号"; exit 1; }
+          fi
+          TAG="v${VER}"
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            if git diff --quiet "$TAG" "$SHA" -- SKILL.md references scripts README.md .claude-plugin; then
+              echo "${TAG} 已经发布过，内容没有变化，跳过。"
+            else
+              echo "::warning::${TAG} 已经发布过，但这次的提交改动了插件内容。请在 plugin.json 里升版本号、在 CHANGELOG.md 补一节，再推送一次。"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "kind=${KIND}"
+            echo "name=${NAME}"
+            echo "version=${VER}"
+            echo "tag=${TAG}"
+            echo "sha=${SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 取出 CHANGELOG 里这一版的说明
+        if: steps.meta.outputs.skip == 'false'
+        env:
+          VER: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - "$VER" > notes.md <<'EOF'
+          import re, sys
+          ver = sys.argv[1]
+          text = open('CHANGELOG.md', encoding='utf-8').read()
+          m = re.search(r'^## v' + re.escape(ver) + r'\b.*?$\n(.*?)(?=^## v|\Z)', text, re.M | re.S)
+          print(m.group(1).strip() if m else '')
+          EOF
+          if [ "$(tr -d '[:space:]' < notes.md)" = "" ]; then
+            echo "::error::CHANGELOG.md 里没有 “## v${VER}” 这一节，补上后再推送。"; exit 1
+          fi
+          cat notes.md
+
+      - name: 打包
+        if: steps.meta.outputs.skip == 'false'
+        id: build
+        env:
+          KIND: ${{ steps.meta.outputs.kind }}
+          NAME: ${{ steps.meta.outputs.name }}
+          VER: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$KIND" = plugin ]; then
+            (cd target && bash build.sh)
+            ASSET=$(ls target/dist/*.plugin)
+          else
+            mkdir -p "pkg/${NAME}"
+            cp -r target/SKILL.md target/references target/scripts "pkg/${NAME}/"
+            find pkg -name '__pycache__' -type d -prune -exec rm -rf {} +
+            (cd pkg && zip -qr "../${NAME}-${VER}.skill" "${NAME}")
+            ASSET="${NAME}-${VER}.skill"
+          fi
+          echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
+
+      - name: 创建 Release
+        if: steps.meta.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          SHA: ${{ steps.meta.outputs.sha }}
+          ASSET: ${{ steps.build.outputs.asset }}
+          LATEST: ${{ github.event_name == 'push' }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" "$ASSET" \
+            --target "$SHA" \
+            --title "Let's Read ${TAG}" \
+            --notes-file notes.md \
+            --latest="$LATEST"
